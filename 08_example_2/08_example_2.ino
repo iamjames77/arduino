@@ -68,11 +68,10 @@ void loop() {
   }
   else {
     if (dist_raw <=200){
-      analogWrite(PIN_LED,-2.55*dist_raw+510);
+      analogWrite(PIN_LED,-0.0255*(dist_raw-100)*(dist_raw-100)+255);
     }
     else {
-      analogWrite(PIN_LED,2.55*dist_raw-510);
-      
+      analogWrite(PIN_LED,-0.0255*(dist_raw-300)*(dist_raw-300)+255);
     }
   }
 

@@ -1,0 +1,233 @@
+#include <Servo.h>
+
+#define PIN_IR A0
+#define PIN_LED 9
+#define PIN_SERVO 10
+
+#define Size 10
+// Servo range
+#define _DUTY_MIN 1100    // [3052] 서보의 최소각도를 microseconds로 표현
+#define _DUTY_NEU 1420   // [3070] 레일플레이트 중립위치를 만드는 서보 duty값
+#define _DUTY_MAX 1700                //[3062] 서보의 최대각도의 microseconds의 값
+
+// Servo speed control
+#define _SERVO_ANGLE 60  // [3131] 최대 가동범위에 따른 목표 서보 회전각
+#define _SERVO_SPEED 2000   //[3064]서보 속도를 30으로
+
+// Event periods
+#define _INTERVAL_DIST 20   // [2635] 적외선센서 업데이트 주기
+#define _INTERVAL_SERVO 60  // [2635] 서보 업데이트 주기
+#define _INTERVAL_SERIAL 100  // [3070] 시리얼 플로터 갱신 속도
+
+#define DELAY_MICROS 1500 // 필터에 넣을 샘플값을 측정하는 딜레이(고정값!)
+#define EMA_ALPHA 0.35
+
+float Kp = 1;
+float Ki = 0.015;
+float Kd = 85;
+
+float ema_dist=0;            // EMA 필터에 사용할 변수
+float filtered_dist;       // 최종 측정된 거리값을 넣을 변수. loop()안에 filtered_dist = filtered_ir_distance(); 형태로 사용하면 됨.
+float samples_num = 3;     // 스파이크 제거를 위한 부분필터에 샘플을 몇개 측정할 것인지. 3개로 충분함! 가능하면 수정하지 말 것.
+
+
+float TargetDistance = 255;
+
+bool event_dist, event_servo, event_serial = false;
+
+
+unsigned long last_sampling_time_dist, last_sampling_time_servo,
+last_sampling_time_serial;
+
+float error;
+float errorPrevious;
+
+double PControl,IControl,DControl;
+double PIDControl;
+
+int duty_chg_per_interval; // [3055] 서보속도 제어를 위한 변수 선언
+int duty_target, duty_curr;
+int duty_neutral = _DUTY_NEU;// [3131] 목표duty, 현재duty
+
+
+int buffer1[Size];
+int pidbuf[Size];
+float sum;
+float psum;
+float dist_Alpha = 0.35;
+int EMA = 0;
+float EMA_R =0;
+int PMA = 0;
+int PMA_R = 0;
+float dist_cali;
+Servo myservo;
+
+int a = 100;
+int b = 400;
+
+void setup() {
+  pinMode(PIN_LED,OUTPUT);
+  digitalWrite(PIN_LED,1);
+  myservo.attach(PIN_SERVO);
+  Serial.begin(57600);
+  duty_chg_per_interval = (_DUTY_MAX - _DUTY_MIN)/(float)(_SERVO_ANGLE) * (_SERVO_SPEED /1000.0)*_INTERVAL_SERVO; 
+  error=_DUTY_NEU;
+  errorPrevious =_DUTY_NEU;
+}
+
+float ir_distance(void){ // return value unit: mm
+  float val;
+  float volt = float(analogRead(PIN_IR));
+  val = ((6762.0/(volt-9.0))-4.0) * 10.0;
+  return val;
+}
+
+float dist_filter(float dist){
+  float FDist;
+  if (dist<=300){
+    FDist = dist/2 + 100;
+  }
+  else if (dist<=450){
+    FDist = dist/3 + 150;
+  }
+  else if (dist<=650){
+    FDist = dist/4 + 750/4;
+  }
+  else {
+    FDist = (dist+1800)/7;
+  }
+
+  return FDist;
+}
+
+float under_noise_filter(void){ // 아래로 떨어지는 형태의 스파이크를 제거해주는 필터
+  int currReading;
+  int largestReading = 0;
+  for (int i = 0; i < samples_num; i++) {
+    currReading = ir_distance();
+    if (currReading > largestReading) { largestReading = currReading; }
+    // Delay a short time before taking another reading
+    delayMicroseconds(DELAY_MICROS);
+  }
+  return largestReading;
+}
+
+float filtered_ir_distance(void){ // 아래로 떨어지는 형태의 스파이크를 제거 후, 위로 치솟는 스파이크를 제거하고 EMA필터를 적용함.
+  // under_noise_filter를 통과한 값을 upper_nosie_filter에 넣어 최종 값이 나옴.
+  int currReading;
+  int lowestReading = 1024;
+  for (int i = 0; i < samples_num; i++) {
+    currReading = under_noise_filter();
+    if (currReading < lowestReading) { lowestReading = currReading; }
+  }
+  // eam 필터 추가
+  ema_dist = EMA_ALPHA*lowestReading + (1-EMA_ALPHA)*ema_dist;
+  return ema_dist;
+}
+//===================================================
+
+
+void loop(){
+  float raw_dist = filtered_ir_distance();
+
+  unsigned long time_curr = millis(); // [3070] 이벤트 업데이트 주기 계산을 위한 현재 시간
+    // [3070] 이벤트 주기가 돌아올때까지 현재시간과 비교하며 기다리도록 함.
+    if(time_curr >= last_sampling_time_dist + _INTERVAL_DIST) {
+        last_sampling_time_dist += _INTERVAL_DIST;
+        event_dist = true;
+    }
+    if(time_curr >= last_sampling_time_servo + _INTERVAL_SERVO) {
+        last_sampling_time_servo += _INTERVAL_SERVO;
+        event_servo = true;
+    }
+    if(time_curr >= last_sampling_time_serial + _INTERVAL_SERIAL) {
+        last_sampling_time_serial += _INTERVAL_SERIAL;
+        event_serial = true;
+    }
+
+  EMA = int(raw_dist)*dist_Alpha + (1 - dist_Alpha)*EMA;
+  sum -= buffer1[0];
+  for(int i=0; i<Size-1;i++)
+  {
+    buffer1[i] = buffer1[i+1];
+  }
+  buffer1[Size-1] = EMA;
+  sum+=buffer1[Size-1];
+  EMA_R = sum /Size+2;
+  dist_cali = dist_filter(EMA_R);
+  
+   
+
+ if(event_dist) {
+        event_dist = false; // [2635] 업데이트 대기
+        // get a distance reading from the distance sensor
+         // [2635] 센서 값 받아와서 변수에 저장
+
+        // [3055] dist_ema 설정
+
+        // PID control logic
+        error = TargetDistance - dist_cali;   
+        PControl = Kp*error;
+        IControl += Ki*error;
+        DControl = Kd*(error-errorPrevious);
+        PIDControl = PControl + IControl + DControl;
+        
+        errorPrevious = error;
+
+
+        // duty_target = f(duty_neutral, control)
+        duty_target = duty_neutral + PIDControl; // [3070] control 값이 다 합해서 1이 되도록 되어있다면, 중립 위치에 컨트롤 값 만큼의 비율을 더해 목표위치를 정한다.
+        
+
+  // keep duty_target value within the range of [_DUTY_MIN, _DUTY_MAX]
+        if(duty_target < _DUTY_MIN)  // [2635] 양극값 넘어가는 경우 극값으로 제한
+        {
+            duty_target = _DUTY_MIN;
+        }
+        if(duty_target > _DUTY_MAX)
+        {
+            duty_target = _DUTY_MAX;
+        }
+  }
+  
+    if(event_servo) {
+        event_servo = false; // [2635] 업데이트 대기
+        // adjust duty_curr toward duty_target by duty_chg_per_interval
+        if(duty_target > duty_curr) { // [3070]
+            duty_curr += duty_chg_per_interval;
+        if(duty_curr > duty_target) duty_curr = duty_target;
+    }
+    else {
+        duty_curr -= duty_chg_per_interval;
+        if(duty_curr < duty_target) duty_curr = duty_target;
+    }
+
+        // update servo position
+        myservo.writeMicroseconds((int)duty_curr); // [3070]
+
+        event_servo = false; // [3055] 모든 작업이 끝나면 이벤트를 다시 false로
+    }
+  
+    if(event_serial) {
+        event_serial = false; // [3070] 이벤트 주기가 왔다면 다시 false로 만들고 이벤트를 수행
+    Serial.print("IR:");
+    Serial.print(dist_cali);
+    Serial.print(",T:");
+    Serial.print(TargetDistance);
+    Serial.print(",P:");
+    Serial.print(map(PControl,-1000,1000,510,610));
+    Serial.print(",D:");
+    Serial.print(map(DControl,-1000,1000,510,610));
+    Serial.print(",I:");
+    Serial.print(map(IControl,-1000,1000,510,610));
+    Serial.print(",DTT:");
+    Serial.print(map(duty_target,1000,2000,410,510));
+    Serial.print(",DTC:");
+    Serial.print(map(duty_curr,1000,2000,410,510));
+    Serial.println(",-G:245,+G:265,m:0,M:800");
+
+        event_serial = false; // [3055] event_serial false로 변경
+    }
+
+  
+}
